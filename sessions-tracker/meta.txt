@@ -1,0 +1,8 @@
+job: sessions-tracker proof of path
+harness_rev: c2f5d90a394b77ffba990d00210dc09fbff5c46c
+source: run/sessions-tracker/ (harness, gitignored, 2026-10-10 prototype by pi/strace)
+tool: sessions-tracker/tools/session (python3 stdlib, flock, best-effort bus mirror)
+data: data/2026-10-10-reboot/ (3 pi sessions, host scrubbed to "laptop")
+scrub: s/Lenovo-V15-G4-AMN/laptop/; no /home paths, IPs, tokens in any file
+cron: reap --ttl 60 every 15 min + nightly backfill (see harness crontab 2026-10-10)
+backfill_method: tools/session-extract/pi.py (usage.input/output/cacheRead, cost.total)
