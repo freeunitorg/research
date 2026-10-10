@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""session -- reboot-proof session registry to sit beside the task ledger (docs/task-ledger.md).
+
+Why files, not sqlite: same verdict as the ledger and the bus (task-ledger.md section 2,
+agent-coordination.md section 1). A model with no tool can `cat` a session file; `rg` and
+`tail` read it; it survives a laptop reboot, a tool crash and ssh; no lock server, no
+schema-version breaks. One file per session under run/sessions-tracker/sessions/.
+
+Layout: sessions/<agent>-<shortid>.md, frontmatter (mutable state) + ## Next + ## Log
+(append-only, bus line grammar with "task" key where it applies). Every write takes flock
+on the session file and mirrors the line to run/inbox/bus.log via tools/inbox (best effort).
+
+Usage:
+  session register --agent pi --session <sid> [--role watcher] [--task pr/588] [--cwd class] [--host laptop]
+  session heartbeat <id> [--tokens-in N --tokens-out N --cache N] [--cost USD] [--ctx PCT] [--turns N] [--model M]
+  session note <id> <text...> [--json T]
+  session next <id> <text...>
+  session done <id> [--reason T] | session dead <id> --reason T
+  session reap [--ttl MIN]          # mark live sessions with stale heartbeat as dead (default 60)
+  session ls [--stale] [--agent A]  # table for humans and for the hermes bridge
+  session show <id> | session brief <id> [--short]
+Env: SESS_ROOT (default <harness>/run/sessions-tracker/sessions), INBOX_SENDER, SESS_HOST.
+Exit 0 ok, 1 refusal (unknown id), 2 usage/setup error.
+"""
+import argparse, datetime, fcntl, json, os, re, sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+TRACKER = os.path.dirname(HERE)
+HARNESS = os.path.dirname(os.path.dirname(TRACKER))
+SESS_ROOT = os.path.abspath(os.environ.get("SESS_ROOT") or os.path.join(TRACKER, "sessions"))
+BUS_LOG = os.path.join(HARNESS, "run", "inbox", "bus.log")
+SENDER = os.environ.get("INBOX_SENDER") or os.environ.get("USER", "agent") + "@sh"
+HOST = os.environ.get("SESS_HOST") or os.uname().nodename
+
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def to_time(ts):
+    return datetime.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+
+
+def age_min(ts):
+    try:
+        return (datetime.datetime.now(datetime.timezone.utc) - to_time(ts)).total_seconds() / 60
+    except (TypeError, ValueError):
+        return 1e9
+
+
+def usage(msg):
+    print("session: " + msg, file=sys.stderr); sys.exit(2)
+
+
+def q(s):
+    """JSON-quote when a bare YAML scalar could misread; mirrors tools/task needs_quotes."""
+    s = str(s)
+    if s == "" or s != s.strip() or s.lower() in {"true", "false", "null", "yes", "no", "on", "off", "~"} \
+            or re.search(r'[:#\[\]{}",]', s) or (s and s[0] in "-?&*!|>'%@`") \
+            or re.fullmatch(r"[-+0-9.][-+0-9._:eExXoObB]*", s):
+        return json.dumps(s)
+    return s
+
+
+def path_of(sid):
+    # sid is <agent>-<shortid>, sanitized; no slashes leave this dir.
+    if not re.fullmatch(r"[a-z0-9]+-[A-Za-z0-9][A-Za-z0-9._-]{0,40}", sid):
+        usage(f"bad session id {sid!r}, want <agent>-<shortid>")
+    p = os.path.realpath(os.path.join(SESS_ROOT, sid + ".md"))
+    if os.path.dirname(p) != os.path.realpath(SESS_ROOT):
+        usage(f"bad session id {sid!r}")
+    return p
+
+
+def parse_front(text):
+    """Minimal frontmatter parse: flat key: value lines only; nested tokens.* handled by prefix."""
+    fm, rest = {}, text
+    m = re.match(r"^---\n(.*?)\n---\n(.*)$", text, re.S)
+    if m:
+        for line in m.group(1).split("\n"):
+            mm = re.match(r"^([A-Za-z0-9_.]+):\s*(.*)$", line)
+            if mm:
+                v = mm.group(2).strip()
+                try:
+                    fm[mm.group(1)] = json.loads(v) if v not in ("",) else ""
+                except ValueError:
+                    fm[mm.group(1)] = v.strip('"')
+        rest = m.group(2)
+    return fm, rest
+
+
+def render(fm, nxt, log):
+    keys = ["id", "agent", "session", "role", "task", "host", "cwd", "status",
+            "started", "heartbeat", "ttl_min", "tokens_in", "tokens_out", "tokens_cache",
+            "cost_usd", "ctx_pct", "turns", "model", "reason", "updated"]
+    out = ["---"]
+    for k in keys:
+        if k in fm and fm[k] not in ("", None):
+            out.append(f"{k}: {q(fm[k])}")
+    out += ["---", "## Next", nxt.strip() or "(empty — not resumable)", "", "## Log"] + log
+    return "\n".join(out) + "\n"
+
+
+def read_locked(path):
+    f = open(path, "r+", encoding="utf-8") if os.path.exists(path) else None
+    if f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        text = f.read()
+    else:
+        text = ""
+    return f, text
+
+
+def bus_emit(text, tail):
+    """Best-effort mirror to the bus; a dead bus never fails the registry write."""
+    try:
+        import random
+        line = f"{now()} {SENDER} fact {random.getrandbits(24):06x} {text[:400]} {json.dumps(tail, separators=(',', ':'))}\n"
+        os.makedirs(os.path.dirname(BUS_LOG), exist_ok=True)
+        with open(BUS_LOG, "a", encoding="utf-8") as b:
+            fcntl.flock(b, fcntl.LOCK_EX)
+            b.write(line)
+    except OSError as e:
+        print(f"session: bus mirror skipped ({e})", file=sys.stderr)
+
+
+def cmd_register(a):
+    os.makedirs(SESS_ROOT, exist_ok=True)
+    sid = f"{a.agent}-{a.session[:12]}"
+    p = path_of(sid)
+    f, text = read_locked(p)
+    if text:
+        print(f"session: {sid} already registered")
+        if f: f.close()
+        return
+    fm = {"id": sid, "agent": a.agent, "session": a.session[:12], "role": a.role or "",
+          "task": a.task or "", "host": a.host or HOST, "cwd": a.cwd or "other",
+          "status": "live", "started": now(), "heartbeat": now(), "ttl_min": a.ttl,
+          "tokens_in": 0, "tokens_out": 0, "tokens_cache": 0, "cost_usd": 0.0,
+          "ctx_pct": -1, "turns": 0, "model": a.model or "", "reason": "", "updated": now()}
+    reg = json.dumps({"session": sid})
+    body = render(fm, a.next_text or "", [fm["started"] + " " + SENDER + " fact registered " + reg])
+    if f is None:
+        open(p, "w", encoding="utf-8").write(body)
+    else:
+        f.seek(0); f.truncate(); f.write(body); f.close()
+    bus_emit(f"session {sid} registered ({a.agent}, task {fm['task'] or '-'})", {"session": sid, "task": fm["task"]})
+    print(sid)
+
+
+def cmd_heartbeat(a):
+    p = path_of(a.id)
+    f, text = read_locked(p)
+    if not text:
+        if f: f.close()
+        sys.exit(f"session: unknown id {a.id}")
+    fm, rest = parse_front(text)
+    m = re.match(r"(?s)^(?:.*?\n)?## Next\n(.*?)\n## Log\n(.*)$", rest)
+    nxt, log = (m.group(1), m.group(2).split("\n") if m else ("", []))
+    fm["heartbeat"] = now(); fm["updated"] = fm["heartbeat"]
+    if fm.get("status") == "dead" and not a.revive:
+        print(f"session: {a.id} is dead (re-register or --revive)", file=sys.stderr)
+    if a.revive: fm["status"] = "live"; fm["reason"] = ""
+    for k, v in (("tokens_in", a.tokens_in), ("tokens_out", a.tokens_out),
+                 ("tokens_cache", a.cache), ("ctx_pct", a.ctx), ("turns", a.turns)):
+        if v is not None: fm[k] = v
+    if a.cost is not None: fm["cost_usd"] = round(float(a.cost), 4)
+    if a.model: fm["model"] = a.model
+    if a.task: fm["task"] = a.task
+    if a.role: fm["role"] = a.role
+    line = f"{fm['heartbeat']} {SENDER} fact heartbeat {json.dumps({'session': a.id, 'task': fm.get('task', ''), 'ctx_pct': fm.get('ctx_pct', -1), 'turns': fm.get('turns', 0)})}"
+    log = [l for l in log if l.strip()] + [line]
+    f.seek(0); f.truncate(); f.write(render(fm, nxt, log)); f.close()
+    print(f"{a.id} heartbeat ctx={fm.get('ctx_pct')} turns={fm.get('turns')}")
+
+
+def cmd_note_next(a, kind):
+    p = path_of(a.id)
+    f, text = read_locked(p)
+    if not text:
+        if f: f.close()
+        sys.exit(f"session: unknown id {a.id}")
+    fm, rest = parse_front(text)
+    m = re.match(r"(?s)^(?:.*?\n)?## Next\n(.*?)\n## Log\n(.*)$", rest)
+    nxt, log = (m.group(1), m.group(2).split("\n") if m else ("", []))
+    body = " ".join(a.text)[:500]
+    if kind == "next":
+        nxt = body
+    tail = {"session": a.id}
+    if fm.get("task"): tail["task"] = fm["task"]
+    if kind == "next": tail["next"] = body[:200]
+    line = f"{now()} {SENDER} fact {kind} {body} {json.dumps(tail)}"
+    fm["heartbeat"] = now(); fm["updated"] = fm["heartbeat"]
+    log = [l for l in log if l.strip()] + [line]
+    f.seek(0); f.truncate(); f.write(render(fm, nxt if kind == "next" else nxt, log)); f.close()
+    bus_emit(f"session {a.id} {kind}: {body[:120]}", tail)
+    print("ok")
+
+
+def cmd_finish(a, status):
+    p = path_of(a.id)
+    f, text = read_locked(p)
+    if not text:
+        if f: f.close()
+        sys.exit(f"session: unknown id {a.id}")
+    fm, rest = parse_front(text)
+    m = re.match(r"(?s)^(?:.*?\n)?## Next\n(.*?)\n## Log\n(.*)$", rest)
+    nxt, log = (m.group(1), m.group(2).split("\n") if m else ("", []))
+    fm["status"] = status; fm["reason"] = " ".join(a.reason)[:300] if a.reason else ""
+    fm["heartbeat"] = now(); fm["updated"] = fm["heartbeat"]
+    line = f"{fm['heartbeat']} {SENDER} fact session-{status} {fm['reason']} {json.dumps({'session': a.id})}"
+    log = [l for l in log if l.strip()] + [line]
+    f.seek(0); f.truncate(); f.write(render(fm, nxt, log)); f.close()
+    bus_emit(f"session {a.id} {status}: {fm['reason'][:120]}", {"session": a.id})
+    print("ok")
+
+
+def cmd_reap(a):
+    n = 0
+    for fn in sorted(os.listdir(SESS_ROOT)):
+        if not fn.endswith(".md"): continue
+        p = os.path.join(SESS_ROOT, fn)
+        with open(p, encoding="utf-8") as fh:
+            fcntl.flock(fh, fcntl.LOCK_SH)
+            fm, _ = parse_front(fh.read())
+        if fm.get("status") != "live": continue
+        if age_min(fm.get("heartbeat", "")) > a.ttl:
+            f, text = read_locked(p)
+            fm2, rest = parse_front(text)
+            if fm2.get("status") == "live" and age_min(fm2.get("heartbeat", "")) > a.ttl:
+                m = re.match(r"(?s)^(?:.*?\n)?## Next\n(.*?)\n## Log\n(.*)$", rest)
+                nxt, log = (m.group(1), m.group(2).split("\n") if m else ("", []))
+                fm2["status"] = "dead"; fm2["reason"] = f"reaped: no heartbeat for {a.ttl} min (reboot/crash?)"
+                fm2["updated"] = now()
+                line = f"{fm2['updated']} {SENDER} fact session-dead reaped {json.dumps({'session': fm2['id']})}"
+                f.seek(0); f.truncate(); f.write(render(fm2, nxt, [l for l in log if l.strip()] + [line])); f.close()
+                bus_emit(f"session {fm2['id']} reaped (stale heartbeat)", {"session": fm2["id"]})
+                n += 1
+            else:
+                f.close()
+    print(f"reaped {n}")
+
+
+def cmd_ls(a):
+    rows = []
+    if not os.path.isdir(SESS_ROOT): return
+    for fn in sorted(os.listdir(SESS_ROOT)):
+        if not fn.endswith(".md"): continue
+        with open(os.path.join(SESS_ROOT, fn), encoding="utf-8") as fh:
+            fm, _ = parse_front(fh.read())
+        if a.agent and fm.get("agent") != a.agent: continue
+        stale = age_min(fm.get("heartbeat", ""))
+        if a.stale and (fm.get("status") != "live" or stale <= a.stale_min): continue
+        rows.append((fm.get("id", fn), fm.get("agent", "?"), fm.get("status", "?"),
+                     fm.get("task", "-") or "-", f"{stale:.0f}m", str(fm.get("ctx_pct", -1)),
+                     str(fm.get("turns", 0)), str(fm.get("cost_usd", 0)), fm.get("heartbeat", "?")[:16]))
+    print(f"{'id':28} {'agent':8} {'status':6} {'task':22} {'age':6} {'ctx%':5} {'turns':6} {'cost':7} heartbeat")
+    for r in rows: print(f"{r[0]:28} {r[1]:8} {r[2]:6} {r[3]:22} {r[4]:6} {r[5]:5} {r[6]:6} {r[7]:7} {r[8]}")
+
+
+def cmd_show(a, short=False):
+    p = path_of(a.id)
+    text = open(p, encoding="utf-8").read() if os.path.exists(p) else sys.exit(f"session: unknown id {a.id}")
+    if short:
+        fm, rest = parse_front(text)
+        m = re.match(r"(?s)^(?:.*?\n)?## Next\n(.*?)\n## Log\n(.*)$", rest)
+        nxt, log = (m.group(1).strip(), [l for l in m.group(2).split("\n") if l.strip()] if m else ("", []))
+        print(f"{fm.get('id')} [{fm.get('agent')}/{fm.get('status')}] task={fm.get('task') or '-'} "
+              f"ctx={fm.get('ctx_pct')} turns={fm.get('turns')} cost={fm.get('cost_usd')} hb={fm.get('heartbeat')}")
+        print("Next: " + (nxt or "(empty)"))
+        for l in log[-5:]: print("  " + l[:220])
+    else:
+        print(text, end="")
+
+
+ap = argparse.ArgumentParser(prog="session")
+sub = ap.add_subparsers(dest="cmd", required=True)
+r = sub.add_parser("register"); r.add_argument("--agent", required=True); r.add_argument("--session", required=True)
+r.add_argument("--role", default=""); r.add_argument("--task", default=""); r.add_argument("--cwd", default="other")
+r.add_argument("--host", default=""); r.add_argument("--model", default=""); r.add_argument("--ttl", type=int, default=60)
+r.add_argument("--next", dest="next_text", default="")
+h = sub.add_parser("heartbeat"); h.add_argument("id"); h.add_argument("--tokens-in", type=int, default=None)
+h.add_argument("--tokens-out", type=int, default=None); h.add_argument("--cache", type=int, default=None)
+h.add_argument("--cost", type=float, default=None); h.add_argument("--ctx", type=float, default=None)
+h.add_argument("--turns", type=int, default=None); h.add_argument("--model", default=""); h.add_argument("--task", default="")
+h.add_argument("--role", default=""); h.add_argument("--revive", action="store_true")
+n = sub.add_parser("note"); n.add_argument("id"); n.add_argument("text", nargs="+"); n.add_argument("--json", default="")
+x = sub.add_parser("next"); x.add_argument("id"); x.add_argument("text", nargs="+")
+d = sub.add_parser("done"); d.add_argument("id"); d.add_argument("--reason", nargs="*", default=[])
+k = sub.add_parser("dead"); k.add_argument("id"); k.add_argument("--reason", nargs="*", default=[])
+p = sub.add_parser("reap"); p.add_argument("--ttl", type=int, default=60)
+l = sub.add_parser("ls"); l.add_argument("--stale", action="store_true"); l.add_argument("--stale-min", type=int, default=60)
+l.add_argument("--agent", default="")
+s = sub.add_parser("show"); s.add_argument("id")
+b = sub.add_parser("brief"); b.add_argument("id"); b.add_argument("--short", action="store_true")
+a = ap.parse_args()
+{"register": cmd_register, "heartbeat": cmd_heartbeat, "reap": cmd_reap, "ls": cmd_ls}.get(a.cmd, lambda x: None)(a) if a.cmd in ("register", "heartbeat", "reap", "ls") else \
+    (cmd_note_next(a, "note") if a.cmd == "note" else cmd_note_next(a, "next") if a.cmd == "next" else cmd_finish(a, "done") if a.cmd == "done" else cmd_finish(a, "dead") if a.cmd == "dead" else cmd_show(a, short=(a.cmd == "brief" and a.short)) if a.cmd in ("show", "brief") else None)
